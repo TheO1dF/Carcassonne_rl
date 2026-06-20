@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Trained models / checkpoints (large binaries)
+models/
+*.zip
+
+# Training logs
+tb_logs/
+runs/
+
+# Generated / downloaded data
+raw_bga_replays/
+kifus/
+
+# Board Game Arena scraper auth state and scratch dumps (may contain secrets)
+bga_state.json
+bga_replay.json
+kifu_bga_replay.json
+test.json
+
+# Scratch notes
+prompt.txt
+prompt1.txt
+prompt2.txt
+
+# Interview content (remove this line if you want it in the repo)
+卡卡颂模型问卷调查.txt
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

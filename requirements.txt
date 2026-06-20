@@ -1,0 +1,18 @@
+# --- Environment (tiles.py, scoring.py, logic.py, env.py) ---
+gymnasium>=1.0
+numpy>=1.24
+
+# --- Training pipeline (rl_model.py, train.py) ---
+# MaskablePPO + custom CNN feature extractor for self-play.
+stable-baselines3>=2.3
+sb3-contrib>=2.3
+torch>=2.1
+tensorboard>=2.12   # optional; training degrades gracefully without it
+
+# --- GUI to play vs the AI (play_gui.py) ---
+# Use pygame-ce on Python >= 3.13 (classic pygame has no wheels there yet).
+pygame-ce>=2.5      # or:  pygame>=2.5
+
+# --- BGA replay scraper (bga_scraper.py) ---
+# Only needed to download replays; after install run `playwright install chromium`.
+playwright>=1.40
