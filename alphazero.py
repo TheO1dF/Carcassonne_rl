@@ -65,6 +65,52 @@ def generate_selfplay_data(model, n_games, n_sims, rng, device=None):
 
 
 # --------------------------------------------------------------------------- #
+# Parallel self-play: many worker processes, CPU inference (frees the GPU and
+# uses all cores). Self-play is CPU-bound -- this is the main speedup.
+# --------------------------------------------------------------------------- #
+_WORKER = {}   # per-process state, populated by _worker_init
+
+
+def _worker_init(model_path, n_sims, mcts_batch):
+    import torch
+    torch.set_num_threads(1)        # avoid N workers x M threads oversubscription
+    from sb3_contrib import MaskablePPO
+    from train import build_single_env
+    model = MaskablePPO.load(model_path, env=build_single_env(seed=0), device="cpu")
+    _WORKER.update(ev=NeuralEvaluator(model, device="cpu"),
+                   n_sims=n_sims, mcts_batch=mcts_batch)
+
+
+def _worker_play(seed):
+    rng = np.random.default_rng(seed)
+    return selfplay_game(_WORKER["ev"], _WORKER["n_sims"], board_size=BOARD_SIZE,
+                         rng=rng, return_info=True, batch_size=_WORKER["mcts_batch"])
+
+
+def generate_selfplay_parallel(model, n_games, n_sims, n_workers, mcts_batch, seed):
+    """Generate ``n_games`` self-play games across ``n_workers`` processes.
+
+    Returns a list of ``(game_records, info)``. Workers load the current net from
+    a temp checkpoint and run inference on CPU, so they parallelise across cores
+    without contending for the GPU.
+    """
+    import multiprocessing as mp
+    tmp = os.path.join(MODELS_DIR, "_az_selfplay_tmp.zip")
+    model.save(tmp)                                   # workers load the current net
+    seeds = [int(seed) + i for i in range(n_games)]
+    ctx = mp.get_context("spawn")
+    results = []
+    with ctx.Pool(n_workers, initializer=_worker_init,
+                  initargs=(tmp, n_sims, mcts_batch)) as pool:
+        stream = pool.imap_unordered(_worker_play, seeds)
+        if tqdm is not None:
+            stream = tqdm(stream, total=n_games, desc="self-play", unit="game")
+        for r in stream:
+            results.append(r)
+    return results
+
+
+# --------------------------------------------------------------------------- #
 # 2. Dataset + collate
 # --------------------------------------------------------------------------- #
 class AlphaZeroDataset(Dataset):
@@ -144,7 +190,7 @@ def train_on_buffer(model, records, epochs, lr, batch_size, device):
 # --------------------------------------------------------------------------- #
 def alphazero_loop(model, iterations, games_per_iter, n_sims, epochs, lr,
                    batch_size, device, rng, buffer_games=BUFFER_GAMES,
-                   mcts_batch=1, save_prefix="model_az",
+                   mcts_batch=1, n_workers=1, save_prefix="model_az",
                    tb_log_dir=os.path.join("tb_logs", "alphazero")):
     os.makedirs(MODELS_DIR, exist_ok=True)
     buffer = deque(maxlen=buffer_games)     # sliding window of per-game records
@@ -155,28 +201,35 @@ def alphazero_loop(model, iterations, games_per_iter, n_sims, epochs, lr,
 
     for it in range(1, iterations + 1):
         print(f"\n===== AlphaZero iteration {it}/{iterations} "
-              f"({games_per_iter} games x {n_sims} sims, device={device}) =====")
+              f"({games_per_iter} games x {n_sims} sims, {n_workers} workers, "
+              f"device={device}) =====")
 
-        # Self-play with the current net, with per-game progress (a self-play
-        # phase can take many minutes and otherwise prints nothing).
-        evaluator = NeuralEvaluator(model, device=device)
+        # Self-play with the current net. Self-play is CPU-bound, so run it across
+        # worker processes when n_workers > 1 (the big speedup on a multi-core CPU).
+        t_sp = time.perf_counter()
+        if n_workers > 1:
+            games_info = generate_selfplay_parallel(
+                model, games_per_iter, n_sims, n_workers, mcts_batch,
+                seed=int(rng.integers(1 << 30)))
+        else:
+            evaluator = NeuralEvaluator(model, device=device)
+            games_info = []
+            bar = (tqdm(range(games_per_iter), desc=f"iter {it} self-play", unit="game")
+                   if tqdm else range(games_per_iter))
+            for _g in bar:
+                games_info.append(selfplay_game(
+                    evaluator, n_sims, board_size=BOARD_SIZE, rng=rng,
+                    return_info=True, batch_size=mcts_batch))
+
         plies, abs_margins, draws = [], [], 0
-        games = range(games_per_iter)
-        bar = tqdm(games, desc=f"iter {it} self-play", unit="game") if tqdm else None
-        for g in (bar or games):
-            t0 = time.perf_counter()
-            game, info = selfplay_game(evaluator, n_sims, board_size=BOARD_SIZE,
-                                       rng=rng, return_info=True, batch_size=mcts_batch)
+        for game, info in games_info:
             buffer.append(game)
             plies.append(info["plies"])
             abs_margins.append(abs(info["margin"]))
             draws += int(info["margin"] == 0)
-            if bar is not None:
-                bar.set_postfix(margin=info["margin"], sec=f"{time.perf_counter()-t0:.0f}")
-            else:
-                print(f"  self-play game {g + 1}/{games_per_iter}  "
-                      f"margin={info['margin']:+d}  ({time.perf_counter()-t0:.0f}s)", flush=True)
         records = [t for game in buffer for t in game]
+        print(f"  self-play {time.perf_counter() - t_sp:.0f}s  "
+              f"({(time.perf_counter() - t_sp) / games_per_iter:.1f}s/game)")
         print(f"  buffer: {len(buffer)} games / {len(records)} positions  "
               f"| avg len {np.mean(plies):.0f}  avg |margin| {np.mean(abs_margins):.1f}  "
               f"draws {draws}/{games_per_iter}")
@@ -216,6 +269,9 @@ def main():
     p.add_argument("--mcts-batch", type=int, default=8,
                    help="leaves per batched network eval during self-play "
                         "(>1 amortises GPU latency; speed/accuracy trade-off)")
+    p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2),
+                   help="parallel self-play worker processes (CPU inference); "
+                        "self-play is CPU-bound, so this is the main speedup")
     p.add_argument("--init-model", type=str, default=None,
                    help="warm-start the network from this .zip (e.g. the BC net)")
     p.add_argument("--device", type=str, default="cuda", choices=("cuda", "cpu"))
@@ -237,7 +293,8 @@ def main():
 
     alphazero_loop(model, args.iterations, args.games_per_iter, args.n_sims,
                    args.epochs, args.lr, args.batch_size, device, rng,
-                   buffer_games=args.buffer_games, mcts_batch=args.mcts_batch)
+                   buffer_games=args.buffer_games, mcts_batch=args.mcts_batch,
+                   n_workers=args.workers)
 
 
 def make_model_env():
